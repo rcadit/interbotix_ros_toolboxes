@@ -1,7 +1,7 @@
 import rospy
 import actionlib
 from std_msgs.msg import Empty
-from kobuki_msgs.msg import Sound, AutoDockingAction, AutoDockingGoal
+from kobuki_msgs.msg import Sound, AutoDockingAction, AutoDockingGoal, DockInfraRed
 from geometry_msgs.msg import Twist, Vector3, PoseStamped, Quaternion
 from sensor_msgs.msg import JointState
 from nav_msgs.msg import Odometry
@@ -25,11 +25,16 @@ from interbotix_perception_modules.armtag import InterbotixArmTagInterface
 ### @param kobuki_joint_states - name of the joints states topic that contains the states of the Kobuki's two wheels
 ### @param use_move_base_action - whether or not Move-Base's Action Server should be used instead of the Topic interface; set to True to make the 'move_to_pose' function block until the robot reaches its goal pose
 class InterbotixLocobotXS(object):
-    def __init__(self, robot_model, arm_model=None, arm_group_name="arm", gripper_name="gripper", turret_group_name="camera", robot_name="locobot", init_node=True, dxl_joint_states="dynamixel/joint_states", kobuki_joint_states="mobile_base/joint_states", use_move_base_action=False):
+    def __init__(self, robot_model, arm_model=None, arm_group_name="arm", 
+                gripper_name="gripper", turret_group_name="camera", 
+                robot_name="locobot", init_node=True, 
+                dxl_joint_states="dynamixel/joint_states", 
+                kobuki_joint_states="mobile_base/joint_states", 
+                use_move_base_action=False, use_dock=False):
         self.dxl = InterbotixRobotXSCore(robot_model, robot_name, init_node, dxl_joint_states)
         self.camera = InterbotixTurretXSInterface(self.dxl, turret_group_name)
         if rospy.has_param("/" + robot_name + "/use_base") and rospy.get_param("/" + robot_name + "/use_base") == True:
-            self.base = InterbotixKobukiInterface(robot_name, kobuki_joint_states, use_move_base_action)
+            self.base = InterbotixKobukiInterface(robot_name, kobuki_joint_states, use_move_base_action, use_dock)
         if rospy.has_param("/" + robot_name + "/use_perception") and rospy.get_param("/" + robot_name + "/use_perception") == True:
             self.pcl = InterbotixPointCloudInterface(robot_name + "/pc_filter", False)
         if arm_model is not None:
@@ -42,15 +47,23 @@ class InterbotixLocobotXS(object):
 ### @param robot_name - namespace of the Kobuki node (a.k.a the name of the Interbotix Locobot)
 ### @param kobuki_joint_states - name of the joints states topic that contains the states of the Kobuki's two wheels
 ### @param use_move_base_action - whether or not Move-Base's Action Server should be used instead of the Topic interface; set to True to make the 'move_to_pose' function block until the robot reaches its goal pose
+### @param use_dock - whether or not the base will ever dock. Setting this to true loads necessary parameters and Action Servers
 class InterbotixKobukiInterface(object):
-    def __init__(self, robot_name, kobuki_joint_states, use_move_base_action):
+    def __init__(self, robot_name, kobuki_joint_states, use_move_base_action, use_dock):
         self.robot_name = robot_name
         self.odom = None
         self.wheel_states = None
         self.use_move_base_action = use_move_base_action
+        self.use_dock = use_dock
         if (self.use_move_base_action):
             self.mb_client = actionlib.SimpleActionClient("/" + self.robot_name + "/move_base", MoveBaseAction)
             self.mb_client.wait_for_server()
+        if (self.use_dock):
+            self.ad_client = actionlib.SimpleActionClient("/" + self.robot_name + "/dock_drive_action", AutoDockingAction)
+            self.ad_client.wait_for_server()
+            self.sub_dock_ir = rospy.Subscriber("/" + self.robot_name + "/mobile_base/sensors/dock_ir", DockInfraRed, self.dock_ir_cb)
+            self.dock_ir = DockInfraRed(data=[0,0,0])
+            self.docked = False
         self.pub_base_command = rospy.Publisher("/" + self.robot_name + "/mobile_base/commands/velocity", Twist, queue_size=1)                     # ROS Publisher to command twists to the Kobuki base
         self.pub_base_reset = rospy.Publisher("/" + self.robot_name + "/mobile_base/commands/reset_odometry", Empty, queue_size=1)                 # ROS Publisher to reset the base odometry
         self.pub_base_sound = rospy.Publisher("/" + self.robot_name + "/mobile_base/commands/sound", Sound, queue_size=1)
@@ -109,47 +122,66 @@ class InterbotixKobukiInterface(object):
     def base_odom_cb(self, msg):
         self.odom = msg.pose.pose
 
-    ### @brief ROS Callback function get get the wheel joint states
+    ### @brief ROS Callback function to get the wheel joint states
     ### @param msg - ROS JointState message from Kobuki
     def wheel_states_cb(self, msg):
         self.wheel_states = msg
 
+    ### @brief ROS Callback function to get the dock ir status
+    ### @param msg - ROS DockInfraRed message from Kobuki
+    def dock_ir_cb(self, msg):
+        self.dock_ir = [ord(c) for c in msg.data]
+
     ### @brief Call action to automatically dock the base to charging station dock
     ### @details - must be near enough to dock to see IR signals (~1 meter in front)
     def auto_dock(self):
-            rospy.loginfo("auto_dock called")
-            try:
-                # set docking action client
-                rospy.loginfo("Calling auto_dock action client...")
-                ad_client = actionlib.SimpleActionClient("/" + self.robot_name + "/auto_dock_action", AutoDockingAction)
-                rospy.loginfo("auto_dock action client called.")
-
-                # connect to Action Server
-                rospy.loginfo("Wating for auto_dock Action Server...")
-                while not ad_client.wait_for_server(timeout=rospy.Duration(secs=5)):
-                    if rospy.is_shutdown(): return False
-                    rospy.loginfo("     Action Server not yet connected...")
-                rospy.loginfo("auto_dock Action Server found.")
-
-                # set docking goal
-                rospy.loginfo("Setting auto_dock goal")
-                ad_goal = AutoDockingGoal()
-                rospy.loginfo("auto_dock goal set.")
-
-                # send docking goal
-                ad_client.send_goal(ad_goal)
-                rospy.on_shutdown(ad_client.cancel_goal())
-
-                # run action and wait 120 seconds for result
-                if ad_client.wait_for_result(timeout=rospy.Duration(secs=120)):
-                    return True
-                else:
+        try:
+            rospy.loginfo("Attempting to autonomously dock to charging station.\n")
+            if not self.can_see_dock_ir():
+                rospy.logwarn("Rotating to find signal.")
+                self.move(yaw=0.5, duration=10.0)
+                if not self.can_see_dock_ir():
+                    rospy.logwarn("Could not find dock, even after rotating.")
                     return False
 
-            # catch interrupts
-            except rospy.ROSInterruptException():
-                rospy.logerr("Docking interrupted by user.")
+            # set docking goal
+            ad_goal = AutoDockingGoal()
+            self.ad_client.send_goal(ad_goal)
+            rospy.on_shutdown(self.ad_client.cancel_goal)
+
+            rospy.loginfo("Attemping to dock...")
+            # run action and wait 120 seconds for result
+            self.ad_client.wait_for_result(rospy.Duration(secs=120))
+            
+            if self.ad_client.get_result():
+                rospy.loginfo("Docking Successful.")
+                self.docked = True
+                return True
+            else:
+                rospy.loginfo("Docking Unsuccessful.")
+                self.docked = False
                 return False
+
+        # catch interrupts
+        except (rospy.ROSInterruptException, KeyboardInterrupt):
+            rospy.logerr("Docking interrupted by user.")
+            self.ad_client.cancel_goal()
+            return False
+        except Exception:
+            rospy.logerr("Docking interrupted unexpectedly.")
+            self.ad_client.cancel_goal()
+            return False
+
+    ### @brief Checks if the robot can see charging station dock IR signals
+    ### @details Must be near to and facing dock to see signals
+    def can_see_dock_ir(self):
+        t_end = rospy.Time.now() + rospy.Duration(3)
+        while rospy.Time.now() < t_end:
+            if any(i > 0 for i in self.dock_ir):
+                rospy.loginfo("Close to dock.")
+                return True
+        rospy.logwarn("Could not find dock.")
+        return False    
 
     ### Get the 2D pose of the robot w.r.t. the robot 'odom' frame
     ### @return pose - list containing the [x, y, yaw] of the robot w.r.t. the odom frame
@@ -163,6 +195,11 @@ class InterbotixKobukiInterface(object):
     ### @return <list> - 2 element list containing the wheel positions [rad]
     def get_wheel_states(self):
         return list(self.wheel_states.position)
+
+    ### Get the current IR data
+    ### @return <list> - 3 element list containing the ir sensor data
+    def get_ir_data(self):
+        return self.dock_ir
 
     ### Reset odometry to zero
     def reset_odom(self):
